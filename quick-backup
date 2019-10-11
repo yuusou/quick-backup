@@ -1,0 +1,113 @@
+#!/bin/bash
+
+PATH=/usr/local/bin:/bin:/usr/bin:/usr/local/sbin:/usr/sbin:/sbin
+
+
+version="quick-backup 0.1
+
+Written by Andre Oliveira (me[at]andreoliveira[dot]io)."
+
+usage="Usage: $0 [source] [filelist] [destination]
+
+Remote SSH backup, as quickly (and sanely) as possible.
+SSH keys required, otherwise what's the point?
+
+
+Positional:
+
+    source          Source Directory.
+    server          Destination server
+    desination      Destination directory.
+
+Report bugs via github."
+
+# Make sure we have the gnu getopt.
+! getopt --test > /dev/null 
+if [[ ${PIPESTATUS[0]} -ne 4 ]]; then
+    echo "`getopt --test` failed in this environment."
+    exit 2
+fi
+
+LCK=/tmp/mail-backup.lock
+[ -e ${LCK} ] && exit 0
+trap "rm -f ${LCK}" INT TERM EXIT
+echo ${PID} > ${LCK}
+
+# Handle positional arguments.
+if [ $# -ne 3 ]; then
+    echo "$usage"
+    exit 1
+fi
+
+directories=()
+PIGZ="-Rr -9 -p 6"
+
+source="${1%/}"
+server="$2"
+destination="${3%/}"
+
+directories=()
+foundEmpty=''
+foundFiles=''
+
+# Fetch closest empty directories, then closest files, then full directories.
+while IFS= read -r -d '' line; do
+    foundEmpty=$(printf '%s%s\0' "${foundEmpty}" "${line}")
+done < <(find ${source} -mindepth 1 -maxdepth 2 -path '*' -type d -empty -print0)
+if [[ ${foundEmpty} ]]; then directories+=("${foundEmpty}"); fi
+
+while IFS= read -r -d '' line; do
+    foundFiles=$(printf '%s%s\0' "${foundFiles}" "${line}")
+done < <(find ${source} -mindepth 1 -maxdepth 2 -path '*' -type f -print0)
+if [[ ${foundFiles} ]]; then directories+=("${foundFiles}"); fi
+
+directories=()
+while IFS= read -r -d '' line; do
+    directories+=("${line}")
+done < <(find ${source} -mindepth 2 -maxdepth 2 -path '*' -type d -not -empty -print0 | awk -F '\0' 'BEGIN { RS = "\0" } ; {a[i++]=$0} END {while(i--) printf "%s\0" , a[i]}')
+if (( ${#directories[@]} == 0 )); then exit 1; fi
+
+# Make remote temp file.
+ssh ${server} "mkdir -p ${destination}/tmp"
+
+# Generate the tarballs.
+(
+    for i in "${!directories[@]}"; do
+        tempFile=$(mktemp /tmp/bckgen.XXXXXX)
+        echo -n "${directories[$i]}" | tar -cpf "${tempFile}" --one-file-system -I pigz --null -T -
+        rename 'bckgen' 'backup' ${tempFile}
+    done
+) & 
+
+tarPid=$!
+
+# Transfer and decompress remotely.
+while [[ $(kill -0 ${tarPid} >/dev/null 2>&1) || -f /tmp/bckgen.* || -f /tmp/backup.* ]] ; do
+    while IFS= read -r -d $'\0' tempFile; do
+        (
+            rsync -avz "${tempFile}" ${server}:"${destination}${tempFile}"
+            ssh ${server} "PIGZ='-p 3' sudo tar -xf \"${destination}${tempFile}\" --same-owner -I pigz -C \"${destination}/\" && rm -f \"${destination}${tempFile}\""
+            rm ${tempFile}
+        ) &
+
+        # Wait for 3 transfers 1 compression or 4 transfers.
+        if (( $(wc -w <<<$(jobs -p)) % 4 == 0 )); then wait; fi
+    done < <(find /tmp -maxdepth 1 -name 'backup.*' -printf "%T@ %p\0" | sort -zk 1nr | sed -z 's/^[^ ]* //' | sed -z '$d')
+done
+
+wait
+
+while IFS= read -r -d $'\0' tempFile; do
+    (
+        rsync -avz "${tempFile}" ${server}:"${destination}${tempFile}"
+        ssh ${server} "PIGZ='-p 3' sudo tar -xf \"${destination}${tempFile}\" --same-owner -I pigz -C \"${destination}/\" && rm -f \"${destination}${tempFile}\""
+        rm ${tempFile}
+    ) &
+
+    # Wait for 3 transfers 1 compression or 4 transfers.
+    if (( $(wc -w <<<$(jobs -p)) % 4 == 0 )); then wait; fi
+done < <(find /tmp -maxdepth 1 -name 'backup.*' -printf "%T@ %p\0" | sort -zk 1nr | sed -z 's/^[^ ]* //')
+
+wait
+
+exit 0
